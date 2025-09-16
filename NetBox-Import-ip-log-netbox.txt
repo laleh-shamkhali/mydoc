@@ -1,0 +1,181 @@
+#######python3 netbox_ip_registration_with_hostname.py
+import nmap
+import requests
+import json
+import ipaddress  # برای پردازش و استخراج subnet
+import csv
+import datetime
+import os
+
+# تنظیمات NetBox
+NETBOX_URL = "https://netbox.yaas.bm"
+API_TOKEN = "eeb8e33cbd44ba679523b42ae24af9febd3b4aaa"
+HEADERS = {
+    "Authorization": f"Token {API_TOKEN}",
+    "Content-Type": "application/json"
+}
+
+# استفاده از فایل برای رنج‌ها
+def read_network_ranges(file_path):
+    """ خواندن رنج‌های شبکه از فایل """
+    with open(file_path, 'r') as file:
+        ranges = [line.strip() for line in file.readlines() if line.strip()]
+    return ranges
+
+# راه اندازی nmap
+nm = nmap.PortScanner()
+
+def discover_hosts(network_range):
+    """ اسکن شبکه برای پیدا کردن IPها، MAC آدرس‌ها، وضعیت‌ها و hostname """
+    print(f"Scanning network: {network_range}")
+    nm.scan(hosts=network_range, arguments="-sn")  # -sn برای اسکن وضعیت هاست‌ها
+
+    discovered_hosts = []
+
+    for host in nm.all_hosts():
+        host_info = {
+            "ip": host,
+            "status": nm[host].state(),
+            "mac": nm[host].get("addresses", {}).get("mac", None),
+        }
+
+        # تلاش برای استخراج hostname و FQDN
+        hostnames = nm[host].get("hostnames", [])
+        fqdn = None
+        if hostnames:
+            fqdn = hostnames[0]  # فرض می‌کنیم که اولین hostname FQDN هست
+        else:
+            fqdn = ""  # اگر هیچ hostname یافت نشد، به جای None یا "Unknown" از رشته خالی استفاده می‌کنیم
+
+        # فقط نام اصلی (hostname) را ذخیره می‌کنیم نه دیکشنری
+        if isinstance(fqdn, dict):
+            fqdn = fqdn.get('name', "")  # اگر دیکشنری باشد، فقط فیلد 'name' را بگیریم
+        print(f"Found hostname for {host}: {fqdn}")
+        
+        host_info["hostname"] = fqdn  # ذخیره FQDN یا رشته خالی
+        discovered_hosts.append(host_info)
+
+    return discovered_hosts
+
+def check_ip_exists(ip):
+    """ بررسی می‌کند که آیا IP در NetBox موجود است یا خیر """
+    response = requests.get(
+        f"{NETBOX_URL}/api/ipam/ip-addresses/?address={ip}",
+        headers=HEADERS,
+        verify=False
+    )
+
+    if response.status_code == 200:
+        data = response.json()
+        if data['results']:
+            return data['results'][0]['id']  # برگشت ID اولین نتیجه
+    return None  # اگر IP وجود نداشت
+
+def update_ip_in_netbox(ip, mac, status, hostname, ip_id, network_range):
+    """ آپدیت IP در NetBox """
+    description = ""  # به جای استفاده از hostname، رشته خالی قرار می‌دهیم
+    
+    # استخراج subnet size (مثلا /27) از رنج شبکه
+    network = ipaddress.IPv4Network(network_range, strict=False)
+    subnet_mask = network.prefixlen  # استخراج اندازه subnet (مثلا 27 برای /27)
+
+    # بررسی اگر hostname موجود است، آن را به عنوان DNS name ثبت کنیم
+    dns_name = hostname if hostname else ""  # به جای None رشته خالی می‌فرستیم
+
+    ip_data = {
+        "address": f"{ip}/{subnet_mask}",
+        "status": "active" if status == "up" else "inactive",
+        "comments": f"MAC: {mac}, Status: {status}",
+        "description": description,
+        "dns_name": dns_name  # ثبت DNS name در اینجا
+    }
+
+    # ارسال درخواست PUT به API NetBox برای آپدیت اطلاعات
+    print(f"Updating IP {ip} in NetBox with DNS name: {dns_name}")
+    response = requests.put(
+        f"{NETBOX_URL}/api/ipam/ip-addresses/{ip_id}/",
+        headers=HEADERS,
+        json=ip_data,
+        verify=False
+    )
+
+    if response.status_code == 200:
+        print(f"IP {ip} updated successfully.")
+        log_discovery(ip, hostname)  # ثبت در فایل لاگ
+    else:
+        print(f"Failed to update IP {ip}: {response.status_code}, {response.text}")
+
+def register_ip_in_netbox(ip, mac, status, hostname, network_range):
+    """ ثبت IP در NetBox """
+    description = ""  # به جای استفاده از hostname، رشته خالی قرار می‌دهیم
+    
+    # استخراج subnet size (مثلا /27) از رنج شبکه
+    network = ipaddress.IPv4Network(network_range, strict=False)
+    subnet_mask = network.prefixlen  # استخراج اندازه subnet (مثلا 27 برای /27)
+
+    # بررسی اگر hostname موجود است، آن را به عنوان DNS name ثبت کنیم
+    dns_name = hostname if hostname else ""  # به جای None رشته خالی می‌فرستیم
+
+    ip_data = {
+        "address": f"{ip}/{subnet_mask}",
+        "status": "active" if status == "up" else "inactive",
+        "comments": f"MAC: {mac}, Status: {status}",
+        "description": description,
+        "dns_name": dns_name  # ثبت DNS name در اینجا
+    }
+
+    # ارسال درخواست POST به API NetBox برای ثبت IP جدید
+    print(f"Registering IP {ip} in NetBox with DNS name: {dns_name}")
+    response = requests.post(
+        f"{NETBOX_URL}/api/ipam/ip-addresses/",
+        headers=HEADERS,
+        json=ip_data,
+        verify=False
+    )
+
+    if response.status_code == 201:
+        print(f"IP {ip} added successfully.")
+        log_discovery(ip, hostname)  # ثبت در فایل لاگ
+    else:
+        print(f"Failed to add IP {ip}: {response.status_code}, {response.text}")
+
+def log_discovery(ip, hostname):
+    """ ثبت IP و Hostname در فایل CSV """
+    today = datetime.datetime.now().strftime('%Y-%m-%d')
+    log_file = f"/home/discovery-log/discovery_log_{today}.csv"
+
+    # بررسی وجود فایل
+    file_exists = os.path.exists(log_file)
+
+    with open(log_file, mode='a', newline='') as file:
+        fieldnames = ['IP', 'Hostname']
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+
+        if not file_exists:
+            writer.writeheader()  # نوشتن هدر اگر فایل جدید باشد
+
+        writer.writerow({'IP': ip, 'Hostname': hostname})  # اضافه کردن رکورد جدید
+
+if __name__ == "__main__":
+    # خواندن رنج‌ها از فایل
+    network_ranges = read_network_ranges("ranges.txt")
+
+    # اسکن هر رنج از فایل
+    for network_range in network_ranges:
+        hosts = discover_hosts(network_range)
+
+        for host in hosts:
+            ip = host["ip"]
+            mac = host["mac"]
+            status = host["status"]
+            hostname = host["hostname"]
+
+            # بررسی موجود بودن IP
+            ip_id = check_ip_exists(ip)
+            
+            if ip_id:
+                # اگر IP موجود است، اطلاعات آن را آپدیت می‌کنیم
+                update_ip_in_netbox(ip, mac, status, hostname, ip_id, network_range)
+            else:
+                # اگر IP جدید است، آن را ثبت می‌کنیم
+                register_ip_in_netbox(ip, mac, status, hostname, network_range)
